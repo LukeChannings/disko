@@ -1,4 +1,4 @@
-{ config, lib, pkgs, extendModules, ... }@args:
+{ config, lib, pkgs, extendModules, modulesPath, ... }@args:
 let
   diskoLib = import ./lib {
     inherit lib;
@@ -69,6 +69,15 @@ in
       type = lib.types.bool;
       default = false;
     };
+    testMode = lib.mkOption {
+      internal = true;
+      description = ''
+        this is true if the system is being run in test mode.
+        like a vm test or an interactive vm
+      '';
+      type = lib.types.bool;
+      default = false;
+    };
     tests = {
       efi = lib.mkOption {
         description = ''
@@ -121,6 +130,85 @@ in
         extraSystemConfig = cfg.tests.extraConfig;
         extraTestScript = cfg.tests.extraChecks;
       };
+
+      vmWithDisko =
+        let
+          vm_disko = (diskoLib.testLib.prepareDiskoConfig config diskoLib.testLib.devices).disko;
+          cfg_ = (lib.evalModules {
+            modules = lib.singleton {
+              # _file = toString input;
+              imports = lib.singleton { disko.devices = vm_disko.devices; };
+              options = {
+                disko.devices = lib.mkOption {
+                  type = diskoLib.toplevel;
+                };
+                disko.testMode = lib.mkOption {
+                  type = lib.types.bool;
+                  default = true;
+                };
+              };
+            };
+          }).config;
+          disks = lib.attrValues cfg_.disko.devices.disk;
+          diskoImages = diskoLib.makeDiskImages {
+            nixosConfig = args;
+            copyNixStore = false;
+            extraConfig = {
+              disko.devices = cfg_.disko.devices;
+            };
+            testMode = true;
+          };
+          rootDisk = {
+            name = "root";
+            file = ''"$tmp"/${(builtins.head disks).name}.qcow2'';
+            driveExtraOpts.cache = "writeback";
+            driveExtraOpts.werror = "report";
+            deviceExtraOpts.bootindex = "1";
+            deviceExtraOpts.serial = "root";
+          };
+          otherDisks = map
+            (disk: {
+              name = disk.name;
+              file = ''"$tmp"/${disk.name}.qcow2'';
+              driveExtraOpts.werror = "report";
+            })
+            (builtins.tail disks);
+          vm = (extendModules {
+            modules = [
+              (modulesPath + "/virtualisation/qemu-vm.nix")
+              {
+                virtualisation.useEFIBoot = cfg.tests.efi;
+                virtualisation.memorySize = cfg.memSize;
+                virtualisation.useDefaultFilesystems = false;
+                virtualisation.writableStore = false;
+                virtualisation.useNixStoreImage = false;
+                virtualisation.efi.keepVariables = false;
+                virtualisation.diskImage = null;
+                virtualisation.qemu.drives = [ rootDisk ] ++ otherDisks;
+                boot.zfs.devNodes = "/dev/disk/by-uuid"; # needed because /dev/disk/by-id is empty in qemu-vms
+              }
+              {
+                # generated from disko config
+                virtualisation.fileSystems = cfg_.disko.devices._config.fileSystems;
+                boot = cfg_.disko.devices._config.boot or { };
+                swapDevices = cfg_.disko.devices._config.swapDevices or [ ];
+              }
+              cfg.tests.extraConfig
+            ];
+          }).config.system.build.vm;
+        in
+        pkgs.writeDashBin "disko-vm" ''
+          set -efux
+          export tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          ${lib.concatMapStringsSep "\n" (disk: ''
+            ${pkgs.qemu}/bin/qemu-img create -f qcow2 \
+            -b ${diskoImages}/${disk.name}.raw \
+            -F raw "$tmp"/${disk.name}.qcow2
+          '') disks}
+          set +f
+          ${vm}/bin/run-*-vm
+        '';
     };
 
 
